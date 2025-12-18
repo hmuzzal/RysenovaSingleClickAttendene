@@ -1,6 +1,8 @@
 ﻿using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using System.Security.Cryptography;
+
 
 namespace KravMagaWorker
 {
@@ -9,29 +11,30 @@ namespace KravMagaWorker
         private readonly ILogger<Worker> _logger;
         private readonly IHttpClientFactory _httpClientFactory;
 
-        private readonly string BasePath = @"C:\KravMagaBd";
-        private readonly string CredFilePath;
+        private readonly string _basePath = @"C:\KravMagaBd";
+        private readonly string _credFilePath;
 
         public Worker(ILogger<Worker> logger, IHttpClientFactory httpClientFactory)
         {
             _logger = logger;
             _httpClientFactory = httpClientFactory;
 
-            if (!Directory.Exists(BasePath))
-                Directory.CreateDirectory(BasePath);
+            if (!Directory.Exists(_basePath))
+                Directory.CreateDirectory(_basePath);
 
-            CredFilePath = Path.Combine(BasePath, "kravmaga_cred.txt");
+            _credFilePath = Path.Combine(_basePath, "kravmaga_cred.txt");
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
             _logger.LogInformation("Worker started at {Time}", DateTime.Now);
-
+            
             await EnsureCredentialFileAsync();
             await SendAttendanceForAllUsers();
 
             await Task.Delay(TimeSpan.FromMinutes(10), stoppingToken);
         }
+
 
         // =========================
         // CREDENTIAL HANDLING
@@ -39,14 +42,14 @@ namespace KravMagaWorker
 
         private async Task EnsureCredentialFileAsync()
         {
-            if (!File.Exists(CredFilePath))
+            if (!File.Exists(_credFilePath))
             {
                 Console.WriteLine("Credential file not found. Creating new one...");
                 await AddCredentialFromConsoleAsync();
                 return;
             }
 
-            var lines = await File.ReadAllLinesAsync(CredFilePath);
+            var lines = await File.ReadAllLinesAsync(_credFilePath);
             if (lines.Length == 0)
             {
                 Console.WriteLine("Credential file exists but empty.");
@@ -65,11 +68,11 @@ namespace KravMagaWorker
             var cred = new UserCredential
             {
                 User_Name = username,
-                Password = password
+                Password = Encrypt(password)
             };
 
-            await File.AppendAllTextAsync(
-                CredFilePath,
+            await File.WriteAllTextAsync(
+                _credFilePath,
                 JsonSerializer.Serialize(cred) + Environment.NewLine
             );
 
@@ -78,23 +81,13 @@ namespace KravMagaWorker
 
         private async Task UpdateCredentialAsync(UserCredential updated)
         {
-            var lines = await File.ReadAllLinesAsync(CredFilePath);
-            var updatedLines = new List<string>();
+            var updatedLines = new List<string> { JsonSerializer.Serialize(updated) };
 
-            foreach (var line in lines)
-            {
-                var cred = JsonSerializer.Deserialize<UserCredential>(line);
-                if (cred.User_Name == updated.User_Name)
-                    updatedLines.Add(JsonSerializer.Serialize(updated));
-                else
-                    updatedLines.Add(line);
-            }
-
-            await File.WriteAllLinesAsync(CredFilePath, updatedLines);
+            await File.WriteAllLinesAsync(_credFilePath, updatedLines);
             Console.WriteLine("Credential updated successfully.\n");
         }
 
-        private string ReadPassword()
+        private static string ReadPassword()
         {
             var pwd = new StringBuilder();
             ConsoleKeyInfo key;
@@ -122,13 +115,16 @@ namespace KravMagaWorker
 
         private async Task SendAttendanceForAllUsers()
         {
-            var lines = await File.ReadAllLinesAsync(CredFilePath);
+            var lines = await File.ReadAllLinesAsync(_credFilePath);
             var client = _httpClientFactory.CreateClient();
 
             foreach (var line in lines)
             {
                 if (string.IsNullOrWhiteSpace(line))
-                    continue;
+                {
+                    Console.WriteLine("No credential found.");
+                    await AddCredentialFromConsoleAsync();
+                }
 
                 try
                 {
@@ -136,8 +132,12 @@ namespace KravMagaWorker
                         new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
 
                     if (cred == null)
-                        continue;
+                    {
+                        Console.WriteLine("No credential found.");
+                        await AddCredentialFromConsoleAsync();
+                    }
 
+                    cred.Password = Decrypt(cred.Password);
                     string token = await GetTokenForUser(client, cred);
                     if (string.IsNullOrEmpty(token))
                         continue;
@@ -218,9 +218,9 @@ namespace KravMagaWorker
                     string message = attendanceDoc.RootElement.GetProperty("message").GetString();
 
                     if (success)
-                        _logger.LogInformation("✅ Attendance success for {User}: {Msg}", cred.User_Name, message);
+                        _logger.LogInformation("Attendance success for {User}: {Msg}", cred.User_Name, message);
                     else
-                        _logger.LogError("❌ Attendance failed for {User}: {Msg}", cred.User_Name, message);
+                        _logger.LogError("Attendance failed for {User}: {Msg}", cred.User_Name, message);
                 }
                 catch (Exception ex)
                 {
@@ -235,7 +235,7 @@ namespace KravMagaWorker
 
         private async Task<string> GetTokenForUser(HttpClient client, UserCredential cred)
         {
-            var tokenFilePath = Path.Combine(BasePath, $"token_{cred.User_Name}.txt");
+            var tokenFilePath = Path.Combine(_basePath, $"token_{cred.User_Name}.txt");
 
             // Try cached token
             if (File.Exists(tokenFilePath))
@@ -296,12 +296,12 @@ namespace KravMagaWorker
                     Console.WriteLine("User chose not to update credentials. Exiting application.");
                     Environment.Exit(0); // Terminate the app gracefully
                 }
-
-                return null; // This line will never be reached, added to satisfy compiler
             }
 
 
-
+            // ---------------------------
+            // Add multiple user
+            // ---------------------------
             var loginResponse = JsonSerializer.Deserialize<LoginResponse>(responseBody,
                 new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
 
@@ -316,6 +316,43 @@ namespace KravMagaWorker
 
             return newTokenStore.AccessToken;
         }
+
+
+        // ---------------------------
+        // Encrypt password
+        // ---------------------------
+        public static string Encrypt(string plainText)
+        {
+            var bytes = Encoding.UTF8.GetBytes(plainText);
+            var encrypted = ProtectedData.Protect(bytes, null, DataProtectionScope.CurrentUser);
+            return Convert.ToBase64String(encrypted);
+        }
+
+        // ---------------------------
+        // Decrypt password
+        // ---------------------------
+        public static string Decrypt(string encryptedText)
+        {
+            var bytes = Convert.FromBase64String(encryptedText);
+            var decrypted = ProtectedData.Unprotect(bytes, null, DataProtectionScope.CurrentUser);
+            return Encoding.UTF8.GetString(decrypted);
+        }
+
+
+        public async Task<HttpResponseMessage> RetryAsync(Func<Task<HttpResponseMessage>> action, int maxRetries = 3)
+        {
+            int delay = 1000; // start with 1s
+            for (int i = 0; i < maxRetries; i++)
+            {
+                var response = await action();
+                if (response.IsSuccessStatusCode) return response;
+
+                await Task.Delay(delay);
+                delay *= 2; // exponential backoff
+            }
+            return new HttpResponseMessage(System.Net.HttpStatusCode.RequestTimeout);
+        }
+
 
         // =========================
         // MODELS
